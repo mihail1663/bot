@@ -1,8 +1,9 @@
 import asyncio
 import logging
 import sqlite3
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, StateFilter, CommandObject
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -11,159 +12,550 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     CallbackQuery, Message
 )
+from typing import Callable, Dict, Any, Awaitable
 
 # ==================== НАСТРОЙКИ ====================
 API_TOKEN = "8461817952:AAG6rIP32PGJy8VJXATI7FXUH9Ed-lXwO2E"
-ADMIN_USERNAME = "Misha172"          # username администратора (без @)
+INITIAL_ADMIN_USERNAME = "Misha172"
 DB_NAME = "bot_database.db"
 
 # ==================== ИНИЦИАЛИЗАЦИЯ БД ====================
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    # Таблица приложений (добавлено поле platform)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS apps (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL,
-            link TEXT NOT NULL,
-            photo_file_id TEXT,
-            platform TEXT NOT NULL DEFAULT 'both'
-        )
-    """)
-    # Таблица пользователей
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            referred_by INTEGER,
-            registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (referred_by) REFERENCES users(user_id)
-        )
-    """)
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS apps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                link TEXT NOT NULL,
+                photo_file_id TEXT,
+                platform TEXT NOT NULL DEFAULT 'both',
+                type TEXT NOT NULL DEFAULT 'app'
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                referred_by INTEGER,
+                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (referred_by) REFERENCES users(user_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (added_by) REFERENCES users(user_id)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS support_tickets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                message TEXT NOT NULL,
+                admin_reply TEXT,
+                status TEXT DEFAULT 'new',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                replied_at TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_link', '')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_id', '')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('group_link', '')")
+        cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('group_id', '')")
+        conn.commit()
+    except Exception as e:
+        logging.error(f"DB init error: {e}")
+    finally:
+        conn.close()
 
 init_db()
 
-# ==================== РАБОТА С ПРИЛОЖЕНИЯМИ ====================
-def get_all_apps():
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT id, name, description, link, photo_file_id, platform FROM apps ORDER BY id")
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+# ==================== ФУНКЦИИ ДЛЯ НАСТРОЕК ПОДПИСКИ ====================
+def get_setting(key: str) -> str:
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else ""
+    except Exception as e:
+        logging.error(f"Error getting setting {key}: {e}")
+        return ""
+    finally:
+        conn.close()
 
-def add_app(name, description, link, photo_file_id=None, platform='both'):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO apps (name, description, link, photo_file_id, platform) VALUES (?, ?, ?, ?, ?)",
-        (name, description, link, photo_file_id, platform)
-    )
-    conn.commit()
-    app_id = cur.lastrowid
-    conn.close()
-    return app_id
+def set_setting(key: str, value: str):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("UPDATE settings SET value=? WHERE key=?", (value, key))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Error setting {key}: {e}")
+    finally:
+        conn.close()
+
+async def is_subscribed(user_id: int) -> bool:
+    channel_id = get_setting('channel_id')
+    group_id = get_setting('group_id')
+    try:
+        if channel_id:
+            channel_member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if channel_member.status not in ['member', 'administrator', 'creator']:
+                return False
+        if group_id:
+            group_member = await bot.get_chat_member(chat_id=group_id, user_id=user_id)
+            if group_member.status not in ['member', 'administrator', 'creator']:
+                return False
+        return True
+    except Exception as e:
+        logging.error(f"Subscription check error: {e}")
+        return True
+
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message | CallbackQuery, Dict[str, Any]], Awaitable[Any]],
+        event: Message | CallbackQuery,
+        data: Dict[str, Any]
+    ) -> Any:
+        try:
+            if isinstance(event, Message) and event.text and event.text.startswith('/start'):
+                return await handler(event, data)
+
+            user = event.from_user
+            if is_admin(user):
+                return await handler(event, data)
+
+            if not await is_subscribed(user.id):
+                channel_link = get_setting('channel_link')
+                group_link = get_setting('group_link')
+                text_parts = ["Для использования бота необходимо подписаться"]
+                inline_buttons = []
+                if channel_link:
+                    text_parts.append(f"📢 на канал: {channel_link}")
+                    inline_buttons.append([InlineKeyboardButton(text="📢 Канал", url=channel_link)])
+                if group_link:
+                    text_parts.append(f"👥 на группу: {group_link}")
+                    inline_buttons.append([InlineKeyboardButton(text="👥 Группа", url=group_link)])
+                if not channel_link and not group_link:
+                    text_parts.append("(ссылки не заданы администратором)")
+                text_parts.append("После подписки нажмите кнопку «Проверить подписку».")
+                text = "\n".join(text_parts)
+                inline_buttons.append([InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")])
+                keyboard = InlineKeyboardMarkup(inline_keyboard=inline_buttons)
+                if isinstance(event, Message):
+                    await event.answer(text, reply_markup=keyboard)
+                else:
+                    await event.message.answer(text, reply_markup=keyboard)
+                    await event.answer()
+                return
+            return await handler(event, data)
+        except Exception as e:
+            logging.error(f"Middleware error: {e}")
+            return await handler(event, data)
+
+# ==================== РАБОТА С ПРИЛОЖЕНИЯМИ/САЙТАМИ ====================
+def get_all_apps():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT id, name, description, link, photo_file_id, platform, type FROM apps ORDER BY id")
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_all_apps: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_count_by_type(content_type):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM apps WHERE type=?", (content_type,))
+        return cur.fetchone()[0]
+    except Exception as e:
+        logging.error(f"Error get_count_by_type: {e}")
+        return 0
+    finally:
+        conn.close()
+
+def add_app(name, description, link, photo_file_id=None, platform='both', type='app'):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO apps (name, description, link, photo_file_id, platform, type) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, description, link, photo_file_id, platform, type)
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception as e:
+        logging.error(f"Error add_app: {e}")
+        return None
+    finally:
+        conn.close()
 
 def delete_app(app_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM apps WHERE id=?", (app_id,))
-    conn.commit()
-    deleted = cur.rowcount > 0
-    conn.close()
-    return deleted
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM apps WHERE id=?", (app_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error delete_app: {e}")
+        return False
+    finally:
+        conn.close()
 
 # ==================== РАБОТА С ПОЛЬЗОВАТЕЛЯМИ ====================
 def get_user(user_id):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, username, first_name, referred_by FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, username, first_name, referred_by, last_active FROM users WHERE user_id=?", (user_id,))
+        return cur.fetchone()
+    except Exception as e:
+        logging.error(f"Error get_user: {e}")
+        return None
+    finally:
+        conn.close()
 
 def add_user(user_id, username, first_name, referred_by=None):
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO users (user_id, username, first_name, referred_by) VALUES (?, ?, ?, ?)",
-            (user_id, username, first_name, referred_by)
-        )
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE users SET username=?, first_name=?, last_active=? WHERE user_id=?",
+                (username, first_name, datetime.now(), user_id)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO users (user_id, username, first_name, referred_by, last_active) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, first_name, referred_by, datetime.now())
+            )
         conn.commit()
-    except sqlite3.IntegrityError:
-        # Пользователь уже существует
-        pass
+    except Exception as e:
+        logging.error(f"Error add_user: {e}")
+    finally:
+        conn.close()
+
+def update_last_active(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("UPDATE users SET last_active=? WHERE user_id=?", (datetime.now(), user_id))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Error update_last_active: {e}")
     finally:
         conn.close()
 
 def get_referrals(user_id):
-    """Возвращает список приглашённых пользователей (user_id, username, first_name)"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT user_id, username, first_name FROM users WHERE referred_by=?",
-        (user_id,)
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_all_users_with_referrers():
-    """Для админа: все пользователи и кто пригласил"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT u.user_id, u.username, u.first_name, u.referred_by,
-               r.username, r.first_name
-        FROM users u
-        LEFT JOIN users r ON u.referred_by = r.user_id
-        ORDER BY u.registered_at
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, username, first_name, registered_at FROM users WHERE referred_by=? ORDER BY registered_at DESC",
+            (user_id,)
+        )
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_referrals: {e}")
+        return []
+    finally:
+        conn.close()
 
 def get_referrer_info(user_id):
-    """Возвращает информацию о том, кто пригласил данного пользователя"""
-    conn = sqlite3.connect(DB_NAME)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT u.user_id, u.username, u.first_name
-        FROM users u
-        WHERE u.user_id = (SELECT referred_by FROM users WHERE user_id = ?)
-    """, (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.user_id, u.username, u.first_name
+            FROM users u
+            WHERE u.user_id = (SELECT referred_by FROM users WHERE user_id = ?)
+        """, (user_id,))
+        return cur.fetchone()
+    except Exception as e:
+        logging.error(f"Error get_referrer_info: {e}")
+        return None
+    finally:
+        conn.close()
 
-# ==================== FSM ДЛЯ ДОБАВЛЕНИЯ ПРИЛОЖЕНИЯ ====================
+def get_all_users_with_referrers():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.user_id, u.username, u.first_name, u.registered_at, u.last_active,
+                   u.referred_by, r.username, r.first_name
+            FROM users u
+            LEFT JOIN users r ON u.referred_by = r.user_id
+            ORDER BY u.registered_at
+        """)
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_all_users_with_referrers: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_referral_links():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT r.username, r.first_name, u.username, u.first_name, u.registered_at
+            FROM users u
+            LEFT JOIN users r ON u.referred_by = r.user_id
+            WHERE u.referred_by IS NOT NULL
+            ORDER BY u.registered_at DESC
+        """)
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_referral_links: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_top_referrers(limit=None):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        query = """
+            SELECT r.user_id, r.username, r.first_name, COUNT(*) as ref_count
+            FROM users u
+            JOIN users r ON u.referred_by = r.user_id
+            GROUP BY r.user_id
+            ORDER BY ref_count DESC
+        """
+        if limit:
+            query += " LIMIT ?"
+            cur.execute(query, (limit,))
+        else:
+            cur.execute(query)
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_top_referrers: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_referrals_with_dates(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT username, first_name, registered_at
+            FROM users
+            WHERE referred_by=?
+            ORDER BY registered_at DESC
+        """, (user_id,))
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_referrals_with_dates: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_total_users():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        return cur.fetchone()[0]
+    except Exception as e:
+        logging.error(f"Error get_total_users: {e}")
+        return 0
+    finally:
+        conn.close()
+
+def get_active_users(days=7):
+    try:
+        since = datetime.now() - timedelta(days=days)
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (since,))
+        return cur.fetchone()[0]
+    except Exception as e:
+        logging.error(f"Error get_active_users: {e}")
+        return 0
+    finally:
+        conn.close()
+
+# ==================== АДМИНИСТРАТОРЫ ====================
+def add_admin(user_id, added_by):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("INSERT INTO admins (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
+        conn.commit()
+        return True
+    except Exception as e:
+        logging.error(f"Error add_admin: {e}")
+        return False
+    finally:
+        conn.close()
+
+def remove_admin(user_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+        conn.commit()
+        return cur.rowcount > 0
+    except Exception as e:
+        logging.error(f"Error remove_admin: {e}")
+        return False
+    finally:
+        conn.close()
+
+def is_admin(user: types.User) -> bool:
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM admins WHERE user_id=?", (user.id,))
+        if cur.fetchone():
+            return True
+    except Exception as e:
+        logging.error(f"Error is_admin: {e}")
+    finally:
+        conn.close()
+    if user.username and user.username.lower() == INITIAL_ADMIN_USERNAME.lower():
+        add_admin(user.id, user.id)
+        return True
+    return False
+
+def get_all_admins():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT a.user_id, u.username, u.first_name, a.added_at
+            FROM admins a
+            LEFT JOIN users u ON a.user_id = u.user_id
+            ORDER BY a.added_at
+        """)
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_all_admins: {e}")
+        return []
+    finally:
+        conn.close()
+
+# ==================== ПОДДЕРЖКА ====================
+def add_support_ticket(user_id, username, first_name, message_text):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO support_tickets (user_id, username, first_name, message) VALUES (?, ?, ?, ?)",
+            (user_id, username, first_name, message_text)
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception as e:
+        logging.error(f"Error add_support_ticket: {e}")
+        return None
+    finally:
+        conn.close()
+
+def get_new_tickets():
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_id, username, first_name, message, created_at FROM support_tickets WHERE status='new' ORDER BY created_at")
+        return cur.fetchall()
+    except Exception as e:
+        logging.error(f"Error get_new_tickets: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_ticket(ticket_id):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("SELECT id, user_id, username, first_name, message, status FROM support_tickets WHERE id=?", (ticket_id,))
+        return cur.fetchone()
+    except Exception as e:
+        logging.error(f"Error get_ticket: {e}")
+        return None
+    finally:
+        conn.close()
+
+def update_ticket_reply(ticket_id, admin_reply):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE support_tickets SET admin_reply=?, status='answered', replied_at=? WHERE id=?",
+            (admin_reply, datetime.now(), ticket_id)
+        )
+        conn.commit()
+    except Exception as e:
+        logging.error(f"Error update_ticket_reply: {e}")
+    finally:
+        conn.close()
+
+# ==================== FSM ====================
 class AddApp(StatesGroup):
+    content_type = State()
+    platform = State()
     name = State()
     description = State()
     link = State()
     photo = State()
-    platform = State()   # новый шаг для выбора платформы
 
-# Хранилище текущих индексов пользователей (для навигации)
+class AddAdmin(StatesGroup):
+    waiting_for_input = State()
+
+class SetSubscription(StatesGroup):
+    waiting_for_channel_link = State()
+    waiting_for_channel_id = State()
+    waiting_for_group_link = State()
+    waiting_for_group_id = State()
+
+class Support(StatesGroup):
+    waiting_for_message = State()
+
+class AdminReply(StatesGroup):
+    waiting_for_reply = State()
+
+# Хранилище для навигации
 user_app_index = {}
 
-# ==================== ИНИЦИАЛИЗАЦИЯ БОТА ====================
+# ==================== БОТ ====================
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # ==================== КЛАВИАТУРЫ ====================
-# Главная reply-клавиатура для всех пользователей (две кнопки)
 reply_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📱 Заработок без вложений")],
-        [KeyboardButton(text="👤 Мой профиль")]
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="📋 История приглашённых")],
+        [KeyboardButton(text="📩 Техподдержка")]
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
@@ -172,130 +564,385 @@ reply_keyboard = ReplyKeyboardMarkup(
 
 def get_admin_keyboard():
     buttons = [
-        [InlineKeyboardButton(text="➕ Добавить приложение", callback_data="admin:add")],
-        [InlineKeyboardButton(text="🗑 Удалить приложение", callback_data="admin:delete")],
-        [InlineKeyboardButton(text="📋 Список приложений", callback_data="admin:list")],
+        [InlineKeyboardButton(text="➕ Добавить приложение/сайт", callback_data="admin:add")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="admin:delete")],
+        [InlineKeyboardButton(text="📋 Список", callback_data="admin:list")],
         [InlineKeyboardButton(text="📊 Рефералы", callback_data="admin:referrals")],
+        [InlineKeyboardButton(text="🏆 Топ рефералов", callback_data="admin:top")],
+        [InlineKeyboardButton(text="📩 Поддержка", callback_data="admin:support")],
+        [InlineKeyboardButton(text="👥 Администраторы", callback_data="admin:admins")],
+        [InlineKeyboardButton(text="📈 Общая статистика", callback_data="admin:stats")],
+        [InlineKeyboardButton(text="🔐 Настройка подписки", callback_data="admin:subscription")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="admin:cancel")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# Клавиатура выбора платформы для админа
+def get_content_type_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Приложение", callback_data="content:app")],
+        [InlineKeyboardButton(text="🌐 Сайт", callback_data="content:site")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="content:cancel")]
+    ])
+
 def get_platform_keyboard():
-    buttons = [
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📱 Android", callback_data="platform:android")],
         [InlineKeyboardButton(text="🍏 iOS", callback_data="platform:ios")],
         [InlineKeyboardButton(text="🔄 Обе платформы", callback_data="platform:both")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="platform:cancel")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    ])
 
-# ==================== ПРОВЕРКА АДМИНА ====================
-def is_admin(user: types.User) -> bool:
-    return user.username and user.username.lower() == ADMIN_USERNAME.lower()
+def get_admins_management_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить администратора", callback_data="admin:add_admin")],
+        [InlineKeyboardButton(text="🗑 Удалить администратора", callback_data="admin:remove_admin")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+    ])
+
+def get_subscription_settings_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Установить ссылку на канал", callback_data="sub:set_channel_link")],
+        [InlineKeyboardButton(text="🆔 Установить ID канала", callback_data="sub:set_channel_id")],
+        [InlineKeyboardButton(text="👥 Установить ссылку на группу", callback_data="sub:set_group_link")],
+        [InlineKeyboardButton(text="🆔 Установить ID группы", callback_data="sub:set_group_id")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+    ])
+
+def get_ticket_notification_keyboard(ticket_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Ответить", callback_data=f"reply_ticket:{ticket_id}"),
+         InlineKeyboardButton(text="⏳ Подождать", callback_data=f"wait_ticket:{ticket_id}")]
+    ])
+
+# ==================== MIDDLEWARE ====================
+dp.message.middleware(SubscriptionMiddleware())
+dp.callback_query.middleware(SubscriptionMiddleware())
 
 # ==================== ОБРАБОТЧИКИ ====================
-# ---------- Команда /start ----------
+@dp.callback_query(lambda c: c.data == "check_sub")
+async def check_subscription_callback(callback: CallbackQuery):
+    try:
+        if await is_subscribed(callback.from_user.id):
+            await callback.message.edit_text("✅ Подписка подтверждена! Теперь вы можете пользоваться ботом.")
+            await callback.message.answer("Главное меню:", reply_markup=reply_keyboard)
+        else:
+            await callback.answer("❌ Вы ещё не подписались. Пожалуйста, подпишитесь.", show_alert=True)
+    except Exception as e:
+        logging.error(f"check_sub error: {e}")
+
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject):
-    user_id = message.from_user.id
-    username = message.from_user.username
-    first_name = message.from_user.first_name
+    try:
+        user_id = message.from_user.id
+        username = message.from_user.username
+        first_name = message.from_user.first_name
 
-    # Проверяем, есть ли пользователь в БД
-    existing = get_user(user_id)
-    if not existing:
-        # Проверяем реферальный параметр
-        referred_by = None
-        if command.args:
-            try:
-                ref_id = int(command.args)
-                # Не даём пригласить самого себя
-                if ref_id != user_id and get_user(ref_id) is not None:
-                    referred_by = ref_id
-            except ValueError:
-                pass
-        add_user(user_id, username, first_name, referred_by)
-        await message.answer(
-            "👋 Добро пожаловать! Я бот с полезными приложениями.\n"
-            "Используй кнопки ниже для навигации.",
-            reply_markup=reply_keyboard
+        if not is_admin(message.from_user) and not await is_subscribed(user_id):
+            channel_link = get_setting('channel_link')
+            group_link = get_setting('group_link')
+            text_parts = ["Для использования бота необходимо подписаться"]
+            inline_buttons = []
+            if channel_link:
+                text_parts.append(f"📢 на канал: {channel_link}")
+                inline_buttons.append([InlineKeyboardButton(text="📢 Канал", url=channel_link)])
+            if group_link:
+                text_parts.append(f"👥 на группу: {group_link}")
+                inline_buttons.append([InlineKeyboardButton(text="👥 Группа", url=group_link)])
+            if not channel_link and not group_link:
+                text_parts.append("(ссылки не заданы администратором)")
+            text_parts.append("После подписки нажмите кнопку «Проверить подписку».")
+            text = "\n".join(text_parts)
+            inline_buttons.append([InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=inline_buttons)
+            await message.answer(text, reply_markup=keyboard)
+            return
+
+        existing = get_user(user_id)
+        if not existing:
+            referred_by = None
+            if command.args:
+                try:
+                    ref_id = int(command.args)
+                    if ref_id != user_id and get_user(ref_id) is not None:
+                        referred_by = ref_id
+                except ValueError:
+                    pass
+            add_user(user_id, username, first_name, referred_by)
+            await message.answer(
+                "👋 Добро пожаловать! Я бот с полезными приложениями и сайтами.\n"
+                "Используй кнопки ниже для навигации.",
+                reply_markup=reply_keyboard
+            )
+        else:
+            update_last_active(user_id)
+            await message.answer("С возвращением!", reply_markup=reply_keyboard)
+    except Exception as e:
+        logging.error(f"start error: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
+
+@dp.message(lambda message: message.text == "📱 Заработок без вложений")
+async def show_apps(message: Message):
+    try:
+        apps = get_all_apps()
+        if not apps:
+            await message.answer("Пока нет добавленных элементов.", reply_markup=reply_keyboard)
+            return
+        user_id = message.from_user.id
+        user_app_index[user_id] = 0
+        await send_app_message(message.chat.id, user_id, 0)
+    except Exception as e:
+        logging.error(f"show_apps error: {e}")
+        await message.answer("Ошибка при загрузке приложений.")
+
+async def send_app_message(chat_id, user_id, index):
+    try:
+        apps = get_all_apps()
+        if index < 0 or index >= len(apps):
+            return
+        app = apps[index]
+        app_id, name, description, link, photo_file_id, platform, ctype = app
+
+        platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
+        platform_text = {"android": "Android", "ios": "iOS", "both": "Android и iOS"}[platform]
+        type_emoji = "📱" if ctype == "app" else "🌐"
+        type_text = "Приложение" if ctype == "app" else "Сайт"
+
+        app_count = get_count_by_type('app')
+        site_count = get_count_by_type('site')
+        counter_info = f"📊 Всего приложений: {app_count}, сайтов: {site_count}"
+
+        text = f"<b>{name}</b>\n\n{description}\n\n{type_emoji} {type_text}\n{platform_emoji} {platform_text}\n\n<a href='{link}'>🔗 Ссылка</a>\n\n{counter_info}"
+
+        buttons = []
+        if index > 0:
+            buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"nav:prev:{index}"))
+        if index < len(apps) - 1:
+            buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"nav:next:{index}"))
+        counter = InlineKeyboardButton(text=f"{index+1}/{len(apps)}", callback_data="ignore")
+        if buttons:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons, [counter]])
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[counter]])
+
+        if photo_file_id:
+            await bot.send_photo(chat_id, photo_file_id, caption=text, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"send_app_message error: {e}")
+
+@dp.callback_query(lambda c: c.data.startswith("nav:"))
+async def process_navigation(callback: CallbackQuery):
+    try:
+        data = callback.data.split(":")
+        action = data[1]
+        current_index = int(data[2])
+        user_id = callback.from_user.id
+        apps = get_all_apps()
+        if not apps:
+            await callback.answer("Нет элементов.")
+            return
+        new_index = current_index
+        if action == "prev" and current_index > 0:
+            new_index = current_index - 1
+        elif action == "next" and current_index < len(apps) - 1:
+            new_index = current_index + 1
+        else:
+            await callback.answer("Невозможно перейти")
+            return
+        user_app_index[user_id] = new_index
+        await callback.message.delete()
+        await send_app_message(callback.message.chat.id, user_id, new_index)
+        await callback.answer()
+    except Exception as e:
+        logging.error(f"navigation error: {e}")
+        await callback.answer("Ошибка навигации.")
+
+@dp.callback_query(lambda c: c.data == "ignore")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
+
+# ==================== ОБЪЕДИНЁННЫЙ ОБРАБОТЧИК СТАТИСТИКИ И ПРОФИЛЯ ====================
+@dp.message(Command("profile", "stats"))
+@dp.message(lambda message: message.text in ["📊 Статистика", "👤 Мой профиль"])
+async def show_user_stats(message: Message):
+    try:
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        if not user:
+            await message.answer("Сначала запустите бота командой /start")
+            return
+
+        first_name = message.from_user.first_name
+        username = message.from_user.username
+
+        total = get_total_users()
+        active = get_active_users(7)
+        apps_count = get_count_by_type('app')
+        sites_count = get_count_by_type('site')
+
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+        ref_link = f"https://t.me/{bot_username}?start={user_id}"
+
+        referrer = get_referrer_info(user_id)
+        if referrer:
+            ref_id, ref_username, ref_first = referrer
+            referrer_text = f"{ref_first}" + (f" (@{ref_username})" if ref_username else "")
+        else:
+            referrer_text = "самостоятельно"
+
+        referrals = get_referrals(user_id)
+        ref_count = len(referrals)
+
+        text = (
+            f"📊 <b>Статистика и профиль</b>\n\n"
+            f"👤 <b>Ваши данные:</b>\n"
+            f"Имя: {first_name}\n"
+            f"Username: @{username if username else 'не установлен'}\n"
+            f"🔗 <b>Реферальная ссылка:</b>\n{ref_link}\n\n"
+            f"👆 Приглашён: {referrer_text}\n"
+            f"👥 Приглашено пользователей: {ref_count}\n"
+            f"📋 Для полного списка используйте кнопку «История приглашённых».\n\n"
+            f"📈 <b>Общая статистика бота:</b>\n"
+            f"👥 Всего пользователей: {total}\n"
+            f"✅ Активных за 7 дней: {active}\n"
+            f"📱 Приложений: {apps_count}\n"
+            f"🌐 Сайтов: {sites_count}"
         )
-    else:
-        await message.answer(
-            "С возвращением!",
-            reply_markup=reply_keyboard
-        )
 
-# ---------- Команда /profile и кнопка "Мой профиль" ----------
-@dp.message(Command("profile"))
-@dp.message(lambda message: message.text == "👤 Мой профиль")
-async def show_profile(message: Message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    if not user:
-        await message.answer("Сначала запустите бота командой /start")
-        return
+        await message.answer(text, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"user_stats error: {e}")
+        await message.answer("Ошибка загрузки данных.")
 
-    # Основная информация
-    first_name = message.from_user.first_name
-    username = message.from_user.username
-    text = f"👤 <b>Профиль</b>\n\n"
-    text += f"Имя: {first_name}\n"
-    if username:
-        text += f"Username: @{username}\n"
-    else:
-        text += f"Username: не установлен\n"
+@dp.message(lambda message: message.text == "📋 История приглашённых")
+@dp.message(Command("history"))
+async def show_referral_history(message: Message):
+    try:
+        user_id = message.from_user.id
+        user = get_user(user_id)
+        if not user:
+            await message.answer("Сначала запустите бота командой /start")
+            return
 
-    # Количество рефералов
-    referrals = get_referrals(user_id)
-    ref_count = len(referrals)
-    text += f"Приглашено пользователей: {ref_count}\n"
+        referrals = get_referrals(user_id)
+        count = len(referrals)
 
-    # Кто пригласил
-    referrer = get_referrer_info(user_id)
-    if referrer:
-        ref_id, ref_username, ref_first = referrer
-        text += f"Приглашён: {ref_first}"
-        if ref_username:
-            text += f" (@{ref_username})"
-        text += "\n"
-    else:
-        text += "Приглашён: самостоятельно\n"
+        if count == 0:
+            await message.answer("Вы ещё никого не пригласили.", reply_markup=reply_keyboard)
+            return
 
-    await message.answer(text, parse_mode="HTML")
-
-# ---------- Команда /ref (реферальная ссылка) ----------
-@dp.message(Command("ref"))
-async def cmd_ref(message: Message):
-    user_id = message.from_user.id
-    user = get_user(user_id)
-    if not user:
-        await message.answer("Сначала запустите бота командой /start")
-        return
-
-    bot_info = await bot.get_me()
-    bot_username = bot_info.username
-    ref_link = f"https://t.me/{bot_username}?start={user_id}"
-
-    referrals = get_referrals(user_id)
-    count = len(referrals)
-
-    text = f"🔗 <b>Ваша реферальная ссылка:</b>\n{ref_link}\n\n"
-    text += f"👥 Приглашено пользователей: {count}\n"
-    if referrals:
-        text += "📋 Список приглашённых:\n"
-        for ref_user_id, ref_username, ref_first in referrals:
-            line = f"• {ref_first}"
+        text = f"📋 <b>История приглашённых</b>\n\nВсего приглашено: {count}\n\n"
+        for idx, (ref_user_id, ref_username, ref_first, reg_date) in enumerate(referrals, 1):
+            date_str = reg_date[:10] if reg_date else "неизвестно"
+            line = f"{idx}. {ref_first}"
             if ref_username:
                 line += f" (@{ref_username})"
+            line += f" — {date_str}"
             text += line + "\n"
-    else:
-        text += "Пока никто не перешёл по вашей ссылке."
 
-    await message.answer(text, parse_mode="HTML")
+        await message.answer(text, parse_mode="HTML", reply_markup=reply_keyboard)
+    except Exception as e:
+        logging.error(f"history error: {e}")
+        await message.answer("Ошибка загрузки истории.")
 
-# ---------- Команда /admin и /a ----------
+# ==================== ТЕХПОДДЕРЖКА ====================
+@dp.message(lambda message: message.text == "📩 Техподдержка")
+@dp.message(Command("support"))
+async def support_start(message: Message, state: FSMContext):
+    try:
+        await message.answer("Напишите ваше сообщение в поддержку. Мы ответим вам как можно скорее.")
+        await state.set_state(Support.waiting_for_message)
+    except Exception as e:
+        logging.error(f"support_start error: {e}")
+
+@dp.message(Support.waiting_for_message)
+async def support_message_received(message: Message, state: FSMContext):
+    try:
+        user_id = message.from_user.id
+        username = message.from_user.username
+        first_name = message.from_user.first_name
+        text = message.text
+
+        ticket_id = add_support_ticket(user_id, username, first_name, text)
+        if not ticket_id:
+            await message.answer("❌ Не удалось создать обращение. Попробуйте позже.")
+            await state.clear()
+            return
+
+        admins = get_all_admins()
+        for admin_id, _, _, _ in admins:
+            try:
+                user_info = f"Пользователь: {first_name}"
+                if username:
+                    user_info += f" (@{username})"
+                user_info += f" (ID: {user_id})"
+                ticket_text = f"📩 <b>Новое обращение #{ticket_id}</b>\n\n{user_info}\n\nСообщение:\n{text}"
+                await bot.send_message(admin_id, ticket_text, parse_mode="HTML", reply_markup=get_ticket_notification_keyboard(ticket_id))
+            except Exception as e:
+                logging.error(f"Failed to notify admin {admin_id}: {e}")
+
+        await message.answer("✅ Ваше сообщение отправлено в поддержку. Ожидайте ответа.", reply_markup=reply_keyboard)
+        await state.clear()
+    except Exception as e:
+        logging.error(f"support_message error: {e}")
+        await message.answer("Ошибка при отправке сообщения.")
+        await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("reply_ticket:"))
+async def reply_to_ticket(callback: CallbackQuery, state: FSMContext):
+    try:
+        if not is_admin(callback.from_user):
+            await callback.answer("Недостаточно прав.")
+            return
+        ticket_id = int(callback.data.split(":")[1])
+        ticket = get_ticket(ticket_id)
+        if not ticket:
+            await callback.answer("Обращение не найдено.")
+            return
+        await state.update_data(reply_ticket_id=ticket_id, reply_user_id=ticket[1])
+        await callback.message.answer(f"Введите ответ для обращения #{ticket_id}:")
+        await state.set_state(AdminReply.waiting_for_reply)
+        await callback.answer()
+    except Exception as e:
+        logging.error(f"reply_ticket error: {e}")
+
+@dp.callback_query(lambda c: c.data.startswith("wait_ticket:"))
+async def wait_ticket(callback: CallbackQuery):
+    try:
+        if not is_admin(callback.from_user):
+            await callback.answer("Недостаточно прав.")
+            return
+        ticket_id = int(callback.data.split(":")[1])
+        await callback.message.edit_text(callback.message.text + "\n\n(Отложено)")
+        await callback.answer("Обращение отложено.")
+    except Exception as e:
+        logging.error(f"wait_ticket error: {e}")
+
+@dp.message(AdminReply.waiting_for_reply)
+async def admin_reply_message(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        ticket_id = data.get('reply_ticket_id')
+        user_id = data.get('reply_user_id')
+        reply_text = message.text
+
+        if not ticket_id or not user_id:
+            await message.answer("Ошибка: не найдена информация об обращении.")
+            await state.clear()
+            return
+
+        await bot.send_message(user_id, f"📩 <b>Ответ от поддержки:</b>\n\n{reply_text}", parse_mode="HTML")
+        update_ticket_reply(ticket_id, reply_text)
+        await message.answer("✅ Ответ отправлен пользователю.", reply_markup=reply_keyboard)
+        await state.clear()
+    except Exception as e:
+        logging.error(f"admin_reply error: {e}")
+        await message.answer("Ошибка при отправке ответа.")
+        await state.clear()
+
+# ==================== АДМИН-ПАНЕЛЬ ====================
 @dp.message(Command("admin", "a"))
 async def cmd_admin(message: Message, state: FSMContext):
     if not is_admin(message.from_user):
@@ -310,164 +957,378 @@ async def cmd_admin(message: Message, state: FSMContext):
     else:
         await message.answer("👑 Панель администратора:", reply_markup=get_admin_keyboard())
 
-# ---------- Обработчик инлайн-кнопок админки ----------
 @dp.callback_query(lambda c: c.data.startswith("admin:"))
 async def process_admin_callback(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
-
     if not is_admin(callback.from_user):
         await callback.answer("Недостаточно прав.")
         return
 
-    if action == "add":
-        await callback.message.delete()
-        await callback.message.answer("Введите название приложения:")
-        await state.set_state(AddApp.name)
-        await callback.answer()
-
-    elif action == "delete":
-        apps = get_all_apps()
-        if not apps:
-            await callback.message.edit_text("Список приложений пуст.")
+    try:
+        if action == "add":
+            await callback.message.delete()
+            await callback.message.answer("Выберите тип:", reply_markup=get_content_type_keyboard())
+            await state.set_state(AddApp.content_type)
             await callback.answer()
-            return
-        kb_buttons = []
-        for app in apps:
-            app_id, name, _, _, _, platform = app
-            short_name = name if len(name) <= 30 else name[:27] + "..."
-            # Добавляем метку платформы
-            platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
-            kb_buttons.append([InlineKeyboardButton(
-                text=f"ID {app_id}: {short_name} {platform_emoji}",
-                callback_data=f"del:{app_id}"
-            )])
-        kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-        await callback.message.edit_text("Выберите приложение для удаления:", reply_markup=keyboard)
-        await callback.answer()
 
-    elif action == "list":
-        apps = get_all_apps()
-        if not apps:
-            text = "Список приложений пуст."
-        else:
-            text = "📋 Список приложений:\n"
+        elif action == "delete":
+            apps = get_all_apps()
+            if not apps:
+                await callback.message.edit_text("Список пуст.")
+                await callback.answer()
+                return
+            kb_buttons = []
             for app in apps:
-                app_id, name, _, _, _, platform = app
-                platform_text = {"android": "Android", "ios": "iOS", "both": "Обе"}[platform]
-                text += f"ID: {app_id} — {name} ({platform_text})\n"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
-        ])
-        await callback.message.edit_text(text, reply_markup=keyboard)
-        await callback.answer()
-
-    elif action == "referrals":
-        data = get_all_users_with_referrers()
-        if not data:
-            await callback.message.edit_text("В базе нет пользователей.")
+                app_id, name, _, _, _, platform, ctype = app
+                short_name = name if len(name) <= 30 else name[:27] + "..."
+                platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
+                type_emoji = "📱" if ctype == "app" else "🌐"
+                kb_buttons.append([InlineKeyboardButton(
+                    text=f"ID {app_id}: {type_emoji} {short_name} {platform_emoji}",
+                    callback_data=f"del:{app_id}"
+                )])
+            kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+            await callback.message.edit_text("Выберите элемент для удаления:", reply_markup=keyboard)
             await callback.answer()
-            return
 
-        text = "📊 <b>Все пользователи и рефералы:</b>\n\n"
-        for row in data:
-            uid, uname, fname, ref_by, ref_uname, ref_fname = row
-            line = f"• {fname} (ID: {uid})"
-            if uname:
-                line += f" @{uname}"
-            if ref_by:
-                line += f"\n  приглашён: {ref_fname or ''}"
-                if ref_uname:
-                    line += f" (@{ref_uname})"
+        elif action == "list":
+            apps = get_all_apps()
+            if not apps:
+                text = "Список пуст."
             else:
-                line += "\n  пришёл самостоятельно"
-            text += line + "\n\n"
+                text = "📋 <b>Список элементов</b>\n\n"
+                app_count = get_count_by_type('app')
+                site_count = get_count_by_type('site')
+                text += f"Всего приложений: {app_count}, сайтов: {site_count}\n\n"
+                for app in apps:
+                    app_id, name, _, _, _, platform, ctype = app
+                    platform_text = {"android": "Android", "ios": "iOS", "both": "Обе"}[platform]
+                    type_text = "Приложение" if ctype == "app" else "Сайт"
+                    text += f"ID: {app_id} — {type_text} «{name}» ({platform_text})\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await callback.answer()
 
-        if len(text) > 3500:
-            text = text[:3500] + "\n\n... (обрезано)"
+        elif action == "referrals":
+            links = get_referral_links()
+            if not links:
+                text = "Нет реферальных связей."
+            else:
+                text = "📊 <b>Реферальные связи (последние 50)</b>\n\n"
+                text += "Пригласивший → Приглашённый (дата)\n"
+                for i, (ref_username, ref_name, user_username, user_name, date) in enumerate(links[:50]):
+                    ref = ref_name if ref_name else "Неизвестно"
+                    if ref_username:
+                        ref += f" (@{ref_username})"
+                    usr = user_name if user_name else "Неизвестно"
+                    if user_username:
+                        usr += f" (@{user_username})"
+                    date_str = date[:10] if date else "неизвестно"
+                    text += f"{i+1}. {ref} → {usr} ({date_str})\n"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await callback.answer()
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
-        ])
-        await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
-        await callback.answer()
+        elif action == "top":
+            top = get_top_referrers(20)
+            if not top:
+                text = "Нет данных о приглашениях."
+            else:
+                text = "🏆 <b>Топ пригласивших (первые 20 за всё время)</b>\n\n"
+                for idx, (user_id, username, first_name, ref_count) in enumerate(top, 1):
+                    name = first_name if first_name else "Неизвестно"
+                    if username:
+                        name += f" (@{username})"
+                    text += f"{idx}. {name} — {ref_count} чел.\n"
+                    referrals = get_referrals_with_dates(user_id)[:3]
+                    for ref_username, ref_name, date in referrals:
+                        ref = ref_name if ref_name else "Неизвестно"
+                        if ref_username:
+                            ref += f" (@{ref_username})"
+                        date_str = date[:10] if date else "неизвестно"
+                        text += f"   └ {ref} ({date_str})\n"
+                    text += "\n"
+                if len(top) == 20:
+                    text += "… и возможно другие (показаны первые 20)."
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await callback.answer()
 
-    elif action == "cancel":
-        await callback.message.delete()
-        await callback.answer("Панель закрыта.")
-        await state.clear()
+        elif action == "support":
+            tickets = get_new_tickets()
+            if not tickets:
+                await callback.message.edit_text("Нет новых обращений в поддержку.", reply_markup=get_admin_keyboard())
+                await callback.answer()
+                return
+            text = "📩 <b>Новые обращения:</b>\n\n"
+            for ticket in tickets:
+                ticket_id, user_id, username, first_name, msg, created = ticket
+                short_msg = msg[:50] + "..." if len(msg) > 50 else msg
+                text += f"#{ticket_id} от {first_name} (@{username or 'нет'}):\n{short_msg}\n\n"
+            buttons = []
+            for ticket in tickets:
+                ticket_id = ticket[0]
+                buttons.append([InlineKeyboardButton(text=f"✏️ Ответить на #{ticket_id}", callback_data=f"reply_ticket:{ticket_id}")])
+            buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await callback.answer()
 
-    elif action == "back":
-        await callback.message.edit_text("👑 Панель администратора:", reply_markup=get_admin_keyboard())
-        await callback.answer()
+        elif action == "admins":
+            admins = get_all_admins()
+            text = "👥 <b>Список администраторов</b>\n\n"
+            if admins:
+                for user_id, username, first_name, added_at in admins:
+                    name = first_name if first_name else "Неизвестно"
+                    if username:
+                        name += f" (@{username})"
+                    text += f"• {name} (ID: {user_id})\n  добавлен: {added_at[:10]}\n\n"
+            else:
+                text += "Нет администраторов, кроме основного."
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_admins_management_keyboard())
+            await callback.answer()
 
-# ---------- Удаление конкретного приложения ----------
+        elif action == "stats":
+            total = get_total_users()
+            active_7d = get_active_users(7)
+            active_1d = get_active_users(1)
+            apps = get_count_by_type('app')
+            sites = get_count_by_type('site')
+            text = f"📈 <b>Общая статистика</b>\n\n👥 Всего пользователей: {total}\n✅ Активных за 7 дней: {active_7d}\n✅ Активных за 1 день: {active_1d}\n📱 Приложений: {apps}\n🌐 Сайтов: {sites}"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+            await callback.answer()
+
+        elif action == "subscription":
+            channel_link = get_setting('channel_link') or "не задана"
+            channel_id = get_setting('channel_id') or "не задан"
+            group_link = get_setting('group_link') or "не задана"
+            group_id = get_setting('group_id') or "не задан"
+            text = (
+                f"🔐 <b>Настройки подписки</b>\n\n"
+                f"📢 Ссылка на канал: {channel_link}\n"
+                f"🆔 ID канала: {channel_id}\n"
+                f"👥 Ссылка на группу: {group_link}\n"
+                f"🆔 ID группы: {group_id}\n\n"
+                "Выберите действие:"
+            )
+            await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_subscription_settings_keyboard())
+            await callback.answer()
+
+        elif action == "add_admin":
+            await callback.message.edit_text("Введите ID или username пользователя (например, @username или 123456):")
+            await state.set_state(AddAdmin.waiting_for_input)
+            await state.update_data(action="add")
+            await callback.answer()
+
+        elif action == "remove_admin":
+            await callback.message.edit_text("Введите ID или username администратора для удаления:")
+            await state.set_state(AddAdmin.waiting_for_input)
+            await state.update_data(action="remove")
+            await callback.answer()
+
+        elif action == "cancel":
+            await callback.message.delete()
+            await callback.answer("Панель закрыта.")
+            await state.clear()
+
+        elif action == "back":
+            await callback.message.edit_text("👑 Панель администратора:", reply_markup=get_admin_keyboard())
+            await callback.answer()
+
+    except Exception as e:
+        logging.error(f"admin callback error: {e}")
+        await callback.answer("Произошла ошибка.")
+
 @dp.callback_query(lambda c: c.data.startswith("del:"))
 async def process_delete_app(callback: CallbackQuery):
+    try:
+        if not is_admin(callback.from_user):
+            await callback.answer("Недостаточно прав.")
+            return
+        app_id = int(callback.data.split(":")[1])
+        apps = get_all_apps()
+        app_to_delete = next((a for a in apps if a[0] == app_id), None)
+        if not app_to_delete:
+            await callback.answer("❌ Элемент не найден.")
+            return
+        ctype = app_to_delete[6]
+        type_ru = "приложений" if ctype == "app" else "сайтов"
+        if delete_app(app_id):
+            count_after = get_count_by_type(ctype)
+            await callback.answer(f"✅ Элемент ID {app_id} удалён. Осталось {count_after} {type_ru}.")
+        else:
+            await callback.answer(f"❌ Ошибка при удалении.")
+            return
+        apps = get_all_apps()
+        if apps:
+            kb_buttons = []
+            for app in apps:
+                app_id, name, _, _, _, platform, ctype = app
+                short_name = name if len(name) <= 30 else name[:27] + "..."
+                platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
+                type_emoji = "📱" if ctype == "app" else "🌐"
+                kb_buttons.append([InlineKeyboardButton(
+                    text=f"ID {app_id}: {type_emoji} {short_name} {platform_emoji}",
+                    callback_data=f"del:{app_id}"
+                )])
+            kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+            keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+            await callback.message.edit_text("Выберите элемент для удаления:", reply_markup=keyboard)
+        else:
+            await callback.message.edit_text("Список пуст.", reply_markup=get_admin_keyboard())
+    except Exception as e:
+        logging.error(f"delete error: {e}")
+
+@dp.message(AddAdmin.waiting_for_input)
+async def process_admin_management(message: Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        action = data.get("action")
+        input_text = message.text.strip()
+
+        target_user_id = None
+        if input_text.startswith('@'):
+            username = input_text[1:].lower()
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users WHERE username=?", (username,))
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                target_user_id = row[0]
+            else:
+                await message.answer("Пользователь с таким username не найден в базе. Возможно, он ещё не запускал бота.")
+                await state.clear()
+                return
+        else:
+            try:
+                target_user_id = int(input_text)
+                if not get_user(target_user_id):
+                    await message.answer("Пользователь с таким ID не найден в базе.")
+                    await state.clear()
+                    return
+            except ValueError:
+                await message.answer("Неверный формат. Введите ID или @username.")
+                return
+
+        if action == "add":
+            if get_user(target_user_id) is None:
+                await message.answer("Пользователь не найден в базе.")
+                await state.clear()
+                return
+            conn = sqlite3.connect(DB_NAME)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM admins WHERE user_id=?", (target_user_id,))
+            if cur.fetchone():
+                conn.close()
+                await message.answer("Этот пользователь уже является администратором.")
+            else:
+                if add_admin(target_user_id, message.from_user.id):
+                    await message.answer(f"✅ Администратор (ID {target_user_id}) добавлен.")
+                else:
+                    await message.answer("❌ Ошибка при добавлении.")
+            conn.close()
+        elif action == "remove":
+            if target_user_id == message.from_user.id:
+                await message.answer("Нельзя удалить самого себя.")
+            else:
+                if remove_admin(target_user_id):
+                    await message.answer(f"✅ Администратор (ID {target_user_id}) удалён.")
+                else:
+                    await message.answer("❌ Ошибка при удалении (возможно, не администратор).")
+        await state.clear()
+        await message.answer("👑 Панель администратора:", reply_markup=get_admin_keyboard())
+    except Exception as e:
+        logging.error(f"admin management error: {e}")
+        await message.answer("Ошибка при обработке.")
+        await state.clear()
+
+@dp.callback_query(lambda c: c.data.startswith("sub:"))
+async def process_subscription_callback(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user):
         await callback.answer("Недостаточно прав.")
         return
-    app_id = int(callback.data.split(":")[1])
-    if delete_app(app_id):
-        await callback.answer(f"✅ Приложение ID {app_id} удалено.")
-    else:
-        await callback.answer(f"❌ Приложение ID {app_id} не найдено.")
+    action = callback.data.split(":")[1]
+    if action == "set_channel_link":
+        await callback.message.edit_text("Введите ссылку на канал (например, https://t.me/...):")
+        await state.set_state(SetSubscription.waiting_for_channel_link)
+    elif action == "set_channel_id":
+        await callback.message.edit_text("Введите ID канала (например, -1001234567890):")
+        await state.set_state(SetSubscription.waiting_for_channel_id)
+    elif action == "set_group_link":
+        await callback.message.edit_text("Введите ссылку на группу (например, https://t.me/...):")
+        await state.set_state(SetSubscription.waiting_for_group_link)
+    elif action == "set_group_id":
+        await callback.message.edit_text("Введите ID группы (например, @group или -100...):")
+        await state.set_state(SetSubscription.waiting_for_group_id)
+    await callback.answer()
 
-    # Обновляем список для удаления
-    apps = get_all_apps()
-    if apps:
-        kb_buttons = []
-        for app in apps:
-            app_id, name, _, _, _, platform = app
-            short_name = name if len(name) <= 30 else name[:27] + "..."
-            platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
-            kb_buttons.append([InlineKeyboardButton(
-                text=f"ID {app_id}: {short_name} {platform_emoji}",
-                callback_data=f"del:{app_id}"
-            )])
-        kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
-        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-        await callback.message.edit_text("Выберите приложение для удаления:", reply_markup=keyboard)
-    else:
-        await callback.message.edit_text("Список приложений пуст.", reply_markup=get_admin_keyboard())
+@dp.message(SetSubscription.waiting_for_channel_link)
+async def set_channel_link(message: Message, state: FSMContext):
+    set_setting('channel_link', message.text.strip())
+    await message.answer("✅ Ссылка на канал сохранена.")
+    await state.clear()
+    await show_subscription_settings(message)
 
-# ---------- FSM: Добавление приложения (с выбором платформы) ----------
-@dp.message(AddApp.name)
-async def add_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
-    await message.answer("Введите описание приложения:")
-    await state.set_state(AddApp.description)
+@dp.message(SetSubscription.waiting_for_channel_id)
+async def set_channel_id(message: Message, state: FSMContext):
+    set_setting('channel_id', message.text.strip())
+    await message.answer("✅ ID канала сохранён.")
+    await state.clear()
+    await show_subscription_settings(message)
 
-@dp.message(AddApp.description)
-async def add_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("Введите ссылку на приложение:")
-    await state.set_state(AddApp.link)
+@dp.message(SetSubscription.waiting_for_group_link)
+async def set_group_link(message: Message, state: FSMContext):
+    set_setting('group_link', message.text.strip())
+    await message.answer("✅ Ссылка на группу сохранена.")
+    await state.clear()
+    await show_subscription_settings(message)
 
-@dp.message(AddApp.link)
-async def add_link(message: Message, state: FSMContext):
-    await state.update_data(link=message.text)
-    await message.answer("Отправьте фото приложения (или напишите 'пропустить'):")
-    await state.set_state(AddApp.photo)
+@dp.message(SetSubscription.waiting_for_group_id)
+async def set_group_id(message: Message, state: FSMContext):
+    set_setting('group_id', message.text.strip())
+    await message.answer("✅ ID группы сохранён.")
+    await state.clear()
+    await show_subscription_settings(message)
 
-@dp.message(AddApp.photo, F.photo)
-async def add_photo(message: Message, state: FSMContext):
-    photo_file_id = message.photo[-1].file_id
-    await state.update_data(photo=photo_file_id)
-    await message.answer("Выберите платформу:", reply_markup=get_platform_keyboard())
+async def show_subscription_settings(message: Message):
+    channel_link = get_setting('channel_link') or "не задана"
+    channel_id = get_setting('channel_id') or "не задан"
+    group_link = get_setting('group_link') or "не задана"
+    group_id = get_setting('group_id') or "не задан"
+    text = (
+        f"🔐 <b>Настройки подписки</b>\n\n"
+        f"📢 Ссылка на канал: {channel_link}\n"
+        f"🆔 ID канала: {channel_id}\n"
+        f"👥 Ссылка на группу: {group_link}\n"
+        f"🆔 ID группы: {group_id}\n\n"
+        "Выберите действие:"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_subscription_settings_keyboard())
+
+@dp.callback_query(AddApp.content_type)
+async def process_content_type(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[1]
+    if action == "cancel":
+        await state.clear()
+        await callback.message.edit_text("Добавление отменено.")
+        await callback.answer()
+        return
+    await state.update_data(content_type=action)
+    await callback.message.edit_text("Выберите платформу:", reply_markup=get_platform_keyboard())
     await state.set_state(AddApp.platform)
+    await callback.answer()
 
-@dp.message(AddApp.photo, F.text.lower() == "пропустить")
-async def skip_photo(message: Message, state: FSMContext):
-    await state.update_data(photo=None)
-    await message.answer("Выберите платформу:", reply_markup=get_platform_keyboard())
-    await state.set_state(AddApp.platform)
-
-@dp.message(AddApp.photo)
-async def incorrect_photo(message: Message):
-    await message.answer("Пожалуйста, отправьте фото или напишите 'пропустить'.")
-
-# Обработчик выбора платформы (инлайн-кнопки)
 @dp.callback_query(AddApp.platform)
 async def process_platform(callback: CallbackQuery, state: FSMContext):
     action = callback.data.split(":")[1]
@@ -476,105 +1337,168 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("Добавление отменено.")
         await callback.answer()
         return
-
-    data = await state.get_data()
-    name = data['name']
-    description = data['description']
-    link = data['link']
-    photo = data.get('photo')
-
-    app_id = add_app(name, description, link, photo, platform=action)
-    await state.clear()
-    await callback.message.delete()
-    await callback.message.answer(f"✅ Приложение добавлено с ID {app_id}.", reply_markup=reply_keyboard)
+    await state.update_data(platform=action)
+    await callback.message.edit_text("Введите название:")
+    await state.set_state(AddApp.name)
     await callback.answer()
 
-# ---------- Команда /cancel (отмена FSM) ----------
+@dp.message(AddApp.name)
+async def add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Введите описание:")
+    await state.set_state(AddApp)
+    await message.answer("Введите описание:")
+    await state.set_state(AddApp.description)
+
+@dp.message(AddApp.description)
+async def add_description(message:.description)
+
+@dp.message(AddApp.description)
+async def add_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("Введите ссылку:")
+    await state.set_state(AddApp.link)
+
+@dp.message(AddApp.link)
+async def add Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("Введите ссылку:")
+    await state.set_state(AddApp.link)
+
+@dp.message(AddApp.link)
+async def add_link(message_link(message: Message, state: FSMContext):
+    await state.update_data(link=message.text)
+: Message, state: FSMContext):
+    await state.update_data(link=message.text)
+    await message.answer("Отправьте фото (или напишите 'пропу    await message.answer("Отправьте фото (или напишите 'пстить'):")
+    await state.set_state(AddApp.photo)
+
+@dp.messageропустить'):")
+    await state.set_state(AddApp.photo)
+
+@dp.message(AddApp.photo, F.(AddApp.photo, F.photo)
+async def add_photo(message: Message, state: FSMContext):
+   photo)
+async def add_photo(message: Message, state: FSMContext photo_file_id = message.photo[-1].file_id
+    data = await state.get_data()
+    content_type = data['content_type']
+):
+    photo_file_id = message.photo[-1].file_id
+    data = await state.get_data()
+    content_type = data['content    count_before = get_count_by_type(content_type)
+    app_id = add_app(
+       _type']
+    count_before = get_count_by_type(content_type)
+    app_id = name=data['name'],
+        description=data['description'],
+        link=data['link'],
+        photo_file_id=photo_file_id,
+        platform=data[' add_app(
+        name=data['name'],
+        description=data['description'],
+        link=data['link'],
+        photo_file_id=photo_file_id,
+        platformplatform'],
+        type=content_type
+    )
+    if app_id:
+        number = count_before + 1
+        type_text = "приложение" if content_type == "app" else "сайт"
+        await message.answer(f"✅ {type_text.capitalize()} добав=data['platform'],
+        type=content_type
+    )
+    if app_id:
+        number = count_before + 1
+        type_text = "приложение" if content_type == "app" else "сайт"
+        await message.answer(f"✅ {type_text.capitalize()} добавлено с ID {app_id}. Это {type_text} №{number}.", reply_markup=reply_keyboard)
+лено с ID {app_id}. Это {type_text} №{number}.", reply_markup=reply_keyboard)
+    else:
+        await message.answer("❌ Ошибка при добав    else:
+        await message.answer("❌ Ошибкалении.")
+    await state.clear()
+
+@dp.message(AddApp.photo, F.text.lower() при добавлении.")
+    await state.clear()
+
+@dp.message(AddApp.photo, F.text.lower() == "пропустить")
+async == "пропустить")
+async def skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    content_type = data['content_type']
+    count_before = get_count_by_type def skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    content_type = data['content_type']
+    count_b(content_type)
+    app_id = add_app(
+        name=data['name'],
+        description=data['description'],
+        link=data['efore = get_count_by_type(content_type)
+    app_id = add_app(
+        name=data['name'],
+        descriptionlink'],
+        photo_file_id=None,
+        platform=data['platform'],
+        type=content_type
+    )
+    if=data['description'],
+        link=data['link'],
+        photo_file_id=None,
+        platform=data['platform'],
+        type=content_type
+    )
+    if app_id:
+        number = count_before + 1
+        app_id:
+        number = count_before + 1
+        type_text = "приложение type_text = "приложение" if content_type == "app" else "сайт"
+        await message." if content_type == "app" else "сайт"
+        await message.answer(f"✅ {type_text.capitalize()} добавлено с ID {app_id} (без фото). Это {type_text} №{number}.", reply_markup=reply_keyboard)
+    else:
+        await message.answer("❌ Ошибка при добавanswer(f"✅ {type_text.capitalize()} добавлено с ID {app_id} (без фото). Это {type_text} №{number}.", reply_markup=reply_keyboard)
+    else:
+        await message.answer("❌ Ошибка при добавлении.")
+    await state.clear()
+
+@dp.message(AddApp.лении.")
+    await state.clear()
+
+@dp.message(AddApp.photo)
+async def incorrect_photo(message: Message):
+    await message.answer("Пожалуйста, отправьте фото или напишите 'пphoto)
+async def incorrect_photo(message: Message):
+    await message.answer("Пожалуйста, отправьте фото или напишите 'пропустить'.")
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message,ропустить'.")
+
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         await message.answer("Нет активного действия.")
+        return state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Нет активного действия.")
         return
+   
     await state.clear()
+    await message.answer("Действие отменено await state.clear()
     await message.answer("Действие отменено.", reply_markup=reply_keyboard)
 
-# ---------- Пользовательская часть: кнопка "Заработок без вложений" ----------
-@dp.message(lambda message: message.text == "📱 Заработок без вложений")
-async def show_apps(message: Message):
-    apps = get_all_apps()
-    if not apps:
-        await message.answer("Пока нет добавленных приложений.", reply_markup=reply_keyboard)
-        return
-    user_id = message.from_user.id
-    user_app_index[user_id] = 0
-    await send_app_message(message.chat.id, user_id, 0)
-
-# Функция отправки карточки приложения с навигацией (с отображением платформы)
-async def send_app_message(chat_id, user_id, index):
-    apps = get_all_apps()
-    if index < 0 or index >= len(apps):
-        return
-    app = apps[index]
-    app_id, name, description, link, photo_file_id, platform = app
-
-    # Определяем эмодзи и текст платформы
-    platform_emoji = "📱" if platform == "android" else "🍏" if platform == "ios" else "🔄"
-    platform_text = {"android": "Android", "ios": "iOS", "both": "Android и iOS"}[platform]
-    platform_str = f"{platform_emoji} {platform_text}"
-
-    text = f"<b>{name}</b>\n\n{description}\n\n{platform_str}\n\n<a href='{link}'>🔗 Ссылка на приложение</a>"
-
-    buttons = []
-    if index > 0:
-        buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"nav:prev:{index}"))
-    if index < len(apps) - 1:
-        buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"nav:next:{index}"))
-    counter = InlineKeyboardButton(text=f"{index+1}/{len(apps)}", callback_data="ignore")
-    if buttons:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons, [counter]])
-    else:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[[counter]])
-
-    if photo_file_id:
-        await bot.send_photo(chat_id, photo_file_id, caption=text, parse_mode="HTML", reply_markup=keyboard)
-    else:
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
-
-# Обработчик навигации по приложениям
-@dp.callback_query(lambda c: c.data.startswith("nav:"))
-async def process_navigation(callback: CallbackQuery):
-    data = callback.data.split(":")
-    action = data[1]
-    current_index = int(data[2])
-    user_id = callback.from_user.id
-    apps = get_all_apps()
-    if not apps:
-        await callback.answer("Нет приложений.")
-        return
-    new_index = current_index
-    if action == "prev" and current_index > 0:
-        new_index = current_index - 1
-    elif action == "next" and current_index < len(apps) - 1:
-        new_index = current_index + 1
-    else:
-        await callback.answer("Невозможно перейти")
-        return
-    user_app_index[user_id] = new_index
-    await callback.message.delete()
-    await send_app_message(callback.message.chat.id, user_id, new_index)
-    await callback.answer()
-
-# Заглушка для игнорируемых кнопок
-@dp.callback_query(lambda c: c.data == "ignore")
-async def ignore_callback(callback: CallbackQuery):
-    await callback.answer()
-
-# ---------- Прочие сообщения ----------
 @dp.message()
 async def other_messages(message: Message):
     await message.answer(
-        "Я понимаю только команды /start, /profile, /ref и кнопки меню.",
+        "Я понимаю только команды /start, /stats.", reply_markup=reply_keyboard)
+
+@dp.message()
+async def other_messages(message: Message):
+    await message.answer(
+        "Я понимаю только команды /start, /stats, /history, /support и кнопки, /history, /support и кнопки меню.",
+        reply_markup=reply_keyboard
+    )
+
+# ==================== З меню.",
         reply_markup=reply_keyboard
     )
 
@@ -583,5 +1507,12 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
+if __АПУСК ====================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
+    asyncio.run(main())
+```name__ == "__main__":
     asyncio.run(main())
