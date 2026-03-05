@@ -113,7 +113,6 @@ def set_setting(key: str, value: str):
         conn.close()
 
 async def is_subscribed(user_id: int) -> bool:
-    """Проверяет подписку на канал и группу (если они настроены)"""
     channel_id = get_setting('channel_id')
     group_id = get_setting('group_id')
     try:
@@ -128,9 +127,8 @@ async def is_subscribed(user_id: int) -> bool:
         return True
     except Exception as e:
         logging.error(f"Subscription check error: {e}")
-        return True  # При ошибке (бот не админ и т.п.) пропускаем
+        return True
 
-# Middleware для проверки подписки перед каждым действием (кроме /start)
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -139,16 +137,13 @@ class SubscriptionMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         try:
-            # Команда /start обрабатывается отдельно, middleware её пропускает
             if isinstance(event, Message) and event.text and event.text.startswith('/start'):
                 return await handler(event, data)
 
             user = event.from_user
-            # Администраторы освобождены от проверки
             if is_admin(user):
                 return await handler(event, data)
 
-            # Если пользователь не подписан – показываем сообщение с требованием подписки
             if not await is_subscribed(user.id):
                 channel_link = get_setting('channel_link')
                 group_link = get_setting('group_link')
@@ -171,11 +166,11 @@ class SubscriptionMiddleware(BaseMiddleware):
                 else:
                     await event.message.answer(text, reply_markup=keyboard)
                     await event.answer()
-                return  # Не передаём дальше
+                return
             return await handler(event, data)
         except Exception as e:
             logging.error(f"Middleware error: {e}")
-            return await handler(event, data)  # Пропускаем при ошибке
+            return await handler(event, data)
 
 # ==================== РАБОТА С ПРИЛОЖЕНИЯМИ/САЙТАМИ ====================
 def get_all_apps():
@@ -647,7 +642,6 @@ async def cmd_start(message: Message, command: CommandObject):
         username = message.from_user.username
         first_name = message.from_user.first_name
 
-        # Проверяем подписку (если настроено)
         if not is_admin(message.from_user) and not await is_subscribed(user_id):
             channel_link = get_setting('channel_link')
             group_link = get_setting('group_link')
@@ -668,7 +662,6 @@ async def cmd_start(message: Message, command: CommandObject):
             await message.answer(text, reply_markup=keyboard)
             return
 
-        # Если подписка есть или не настроена – продолжаем
         existing = get_user(user_id)
         if not existing:
             referred_by = None
