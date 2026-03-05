@@ -1,17 +1,86 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
+import sqlite3
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, Message
+)
 
-logging.basicConfig(level=logging.INFO)
-
+# Настройки
 API_TOKEN = "8461817952:AAG6rIP32PGJy8VJXATI7FXUH9Ed-lXwO2E"
+ADMIN_USERNAME = "Misha172"  # без @
+DB_NAME = "apps.db"
 
+# Инициализация БД
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS apps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            link TEXT NOT NULL,
+            photo_file_id TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# Работа с БД
+def get_all_apps():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("SELECT id, name, description, link, photo_file_id FROM apps ORDER BY id")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def add_app(name, description, link, photo_file_id=None):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO apps (name, description, link, photo_file_id) VALUES (?, ?, ?, ?)",
+        (name, description, link, photo_file_id)
+    )
+    conn.commit()
+    app_id = cur.lastrowid
+    conn.close()
+    return app_id
+
+def delete_app(app_id):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM apps WHERE id=?", (app_id,))
+    conn.commit()
+    deleted = cur.rowcount > 0
+    conn.close()
+    return deleted
+
+# FSM для добавления приложения
+class AddApp(StatesGroup):
+    name = State()
+    description = State()
+    link = State()
+    photo = State()
+
+# Хранилище текущих индексов пользователей (для навигации)
+user_app_index = {}
+
+# Инициализация бота
 bot = Bot(token=API_TOKEN)
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-# Создаём клавиатуру
+# Клавиатура для всех пользователей
 reply_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Заработок без вложений")],
@@ -21,6 +90,11 @@ reply_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Нажмите кнопку для получения информации"
 )
 
+# Проверка прав администратора
+def is_admin(user: types.User) -> bool:
+    return user.username and user.username.lower() == ADMIN_USERNAME.lower()
+
+# Команда /start
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -29,21 +103,187 @@ async def cmd_start(message: Message):
         reply_markup=reply_keyboard
     )
 
-@dp.message(lambda message: message.text == "Заработок без вложений")
-async def earn_without_invest(message: Message):
-    # Здесь можно разместить любой текст, ссылки, инструкции и т.д.
-    text = "Заработок без вложений: информация будет добавлена позже."
-    await message.answer(text, parse_mode="Markdown")
+# Команда /add_app (только админ)
+@dp.message(Command("add_app"), StateFilter(None))
+async def cmd_add_app(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await message.answer("Эта команда только для администратора.")
+        return
+    await message.answer("Введите название приложения:")
+    await state.set_state(AddApp.name)
 
+@dp.message(AddApp.name)
+async def add_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Введите описание приложения:")
+    await state.set_state(AddApp.description)
+
+@dp.message(AddApp.description)
+async def add_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("Введите ссылку на приложение:")
+    await state.set_state(AddApp.link)
+
+@dp.message(AddApp.link)
+async def add_link(message: Message, state: FSMContext):
+    await state.update_data(link=message.text)
+    await message.answer("Отправьте фото приложения (или напишите 'пропустить'):")
+    await state.set_state(AddApp.photo)
+
+@dp.message(AddApp.photo, F.photo)
+async def add_photo(message: Message, state: FSMContext):
+    photo_file_id = message.photo[-1].file_id
+    data = await state.get_data()
+    app_id = add_app(
+        name=data['name'],
+        description=data['description'],
+        link=data['link'],
+        photo_file_id=photo_file_id
+    )
+    await state.clear()
+    await message.answer(f"✅ Приложение добавлено с ID {app_id}.", reply_markup=reply_keyboard)
+
+@dp.message(AddApp.photo, F.text.lower() == "пропустить")
+async def skip_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    app_id = add_app(
+        name=data['name'],
+        description=data['description'],
+        link=data['link'],
+        photo_file_id=None
+    )
+    await state.clear()
+    await message.answer(f"✅ Приложение добавлено с ID {app_id} (без фото).", reply_markup=reply_keyboard)
+
+@dp.message(AddApp.photo)
+async def incorrect_photo(message: Message):
+    await message.answer("Пожалуйста, отправьте фото или напишите 'пропустить'.")
+
+# Команда /del_app (только админ)
+@dp.message(Command("del_app"))
+async def cmd_del_app(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("Эта команда только для администратора.")
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("Использование: /del_app <id>")
+        return
+    try:
+        app_id = int(args[1])
+    except ValueError:
+        await message.answer("ID должно быть числом.")
+        return
+    if delete_app(app_id):
+        await message.answer(f"🗑 Приложение с ID {app_id} удалено.")
+    else:
+        await message.answer(f"❌ Приложение с ID {app_id} не найдено.")
+
+# Команда /list_apps (только админ)
+@dp.message(Command("list_apps"))
+async def cmd_list_apps(message: Message):
+    if not is_admin(message.from_user):
+        await message.answer("Эта команда только для администратора.")
+        return
+    apps = get_all_apps()
+    if not apps:
+        await message.answer("Список приложений пуст.")
+        return
+    text = "📋 Список приложений:\n"
+    for app in apps:
+        text += f"ID: {app[0]} — {app[1]}\n"
+    await message.answer(text)
+
+# Команда /cancel (выход из FSM)
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("Нет активного действия.")
+        return
+    await state.clear()
+    await message.answer("Действие отменено.", reply_markup=reply_keyboard)
+
+# Обработчик reply-кнопки "Заработок без вложений"
+@dp.message(lambda message: message.text == "Заработок без вложений")
+async def show_apps(message: Message):
+    apps = get_all_apps()
+    if not apps:
+        await message.answer("Пока нет добавленных приложений.", reply_markup=reply_keyboard)
+        return
+    user_id = message.from_user.id
+    user_app_index[user_id] = 0  # всегда начинаем с первого
+    await send_app_message(message.chat.id, user_id, 0)
+
+# Функция отправки карточки приложения с навигацией
+async def send_app_message(chat_id, user_id, index):
+    apps = get_all_apps()
+    if index < 0 or index >= len(apps):
+        return
+    app = apps[index]
+    app_id, name, description, link, photo_file_id = app
+    text = f"<b>{name}</b>\n\n{description}\n\n<a href='{link}'>🔗 Ссылка на приложение</a>"
+
+    # Построение инлайн-клавиатуры
+    buttons = []
+    if index > 0:
+        buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"nav:prev:{index}"))
+    if index < len(apps) - 1:
+        buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"nav:next:{index}"))
+    counter = InlineKeyboardButton(text=f"{index+1}/{len(apps)}", callback_data="ignore")
+    # Если есть обе кнопки — ряд из двух, затем счётчик отдельно
+    if buttons:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons, [counter]])
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[counter]])
+
+    if photo_file_id:
+        await bot.send_photo(chat_id, photo_file_id, caption=text, parse_mode="HTML", reply_markup=keyboard)
+    else:
+        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+
+# Обработчик навигации (callback)
+@dp.callback_query(lambda c: c.data.startswith("nav:"))
+async def process_navigation(callback: CallbackQuery):
+    data = callback.data.split(":")
+    action = data[1]
+    current_index = int(data[2])
+    user_id = callback.from_user.id
+    apps = get_all_apps()
+    if not apps:
+        await callback.answer("Нет приложений.")
+        return
+    new_index = current_index
+    if action == "prev" and current_index > 0:
+        new_index = current_index - 1
+    elif action == "next" and current_index < len(apps) - 1:
+        new_index = current_index + 1
+    else:
+        await callback.answer("Невозможно перейти")
+        return
+    user_app_index[user_id] = new_index
+    # Удаляем старое сообщение и отправляем новое (для смены фото)
+    await callback.message.delete()
+    await send_app_message(callback.message.chat.id, user_id, new_index)
+    await callback.answer()
+
+# Заглушка для игнорируемых кнопок
+@dp.callback_query(lambda c: c.data == "ignore")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
+
+# Обработчик прочих сообщений
 @dp.message()
 async def other_messages(message: Message):
     await message.answer(
         "Я понимаю только команду /start и кнопку «Заработок без вложений».",
-        reply_markup=reply_keyboard   # исправлено: было "board", стало "reply_keyboard"
+        reply_markup=reply_keyboard
     )
 
+# Запуск бота
 async def main():
+    logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())   # исправлено: было "async.run", стало "asyncio.run"
+    asyncio.run(main())
