@@ -94,15 +94,134 @@ reply_keyboard = ReplyKeyboardMarkup(
 def is_admin(user: types.User) -> bool:
     return user.username and user.username.lower() == ADMIN_USERNAME.lower()
 
-# Команда /start
-@dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        "Привет! Я бот, который поможет тебе узнать о заработке без вложений.\n"
-        "Нажми кнопку ниже, чтобы получить информацию.",
-        reply_markup=reply_keyboard
-    )
+# ---------- АДМИН-ПАНЕЛЬ (ИНЛАЙН-КНОПКИ) ----------
+def get_admin_keyboard():
+    buttons = [
+        [InlineKeyboardButton(text="➕ Добавить приложение", callback_data="admin:add")],
+        [InlineKeyboardButton(text="🗑 Удалить приложение", callback_data="admin:delete")],
+        [InlineKeyboardButton(text="📋 Список приложений", callback_data="admin:list")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+# Команда /admin и /a
+@dp.message(Command("admin", "a"))
+async def cmd_admin(message: Message, state: FSMContext):
+    if not is_admin(message.from_user):
+        await message.answer("Эта команда только для администратора.")
+        return
+    # Если есть активное состояние, предложим отменить
+    current_state = await state.get_state()
+    if current_state:
+        await message.answer(
+            "У вас есть незавершённое действие. Используйте кнопку «❌ Отмена» или команду /cancel.",
+            reply_markup=get_admin_keyboard()
+        )
+    else:
+        await message.answer("Панель администратора:", reply_markup=get_admin_keyboard())
+
+# Обработчик нажатий на инлайн-кнопки админки
+@dp.callback_query(lambda c: c.data.startswith("admin:"))
+async def process_admin_callback(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[1]
+    user_id = callback.from_user.id
+
+    # Проверка прав (лишний раз)
+    if not is_admin(callback.from_user):
+        await callback.answer("Недостаточно прав.")
+        return
+
+    if action == "add":
+        # Запуск процесса добавления (как /add_app)
+        await callback.message.delete()
+        await callback.message.answer("Введите название приложения:")
+        await state.set_state(AddApp.name)
+        await callback.answer()
+
+    elif action == "delete":
+        # Показать список приложений для удаления (инлайн-кнопки с ID)
+        apps = get_all_apps()
+        if not apps:
+            await callback.message.edit_text("Список приложений пуст.")
+            await callback.answer()
+            return
+        # Формируем клавиатуру: по одному приложению в ряду
+        kb_buttons = []
+        for app in apps:
+            app_id, name, _, _, _ = app
+            # Обрезаем длинные названия
+            short_name = name if len(name) <= 30 else name[:27] + "..."
+            kb_buttons.append([InlineKeyboardButton(
+                text=f"ID {app_id}: {short_name}",
+                callback_data=f"del:{app_id}"
+            )])
+        kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+        await callback.message.edit_text("Выберите приложение для удаления:", reply_markup=keyboard)
+        await callback.answer()
+
+    elif action == "list":
+        # Показать список приложений (как /list_apps)
+        apps = get_all_apps()
+        if not apps:
+            await callback.message.edit_text("Список приложений пуст.")
+        else:
+            text = "📋 Список приложений:\n"
+            for app in apps:
+                text += f"ID: {app[0]} — {app[1]}\n"
+            # Добавим кнопку "Назад"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")]
+            ])
+            await callback.message.edit_text(text, reply_markup=keyboard)
+        await callback.answer()
+
+    elif action == "cancel":
+        # Отмена текущего состояния FSM
+        current_state = await state.get_state()
+        if current_state:
+            await state.clear()
+            await callback.message.edit_text("Действие отменено.", reply_markup=get_admin_keyboard())
+        else:
+            await callback.message.edit_text("Нет активного действия.", reply_markup=get_admin_keyboard())
+        await callback.answer()
+
+    elif action == "back":
+        # Возврат в главное меню админки
+        await callback.message.edit_text("Панель администратора:", reply_markup=get_admin_keyboard())
+        await callback.answer()
+
+# Обработчик для удаления конкретного приложения (callback от кнопки del:ID)
+@dp.callback_query(lambda c: c.data.startswith("del:"))
+async def process_delete_app(callback: CallbackQuery):
+    if not is_admin(callback.from_user):
+        await callback.answer("Недостаточно прав.")
+        return
+    app_id = int(callback.data.split(":")[1])
+    if delete_app(app_id):
+        await callback.answer(f"✅ Приложение ID {app_id} удалено.")
+    else:
+        await callback.answer(f"❌ Приложение ID {app_id} не найдено.")
+    # После удаления возвращаемся в меню удаления (обновляем список)
+    apps = get_all_apps()
+    if apps:
+        # Показываем обновлённый список
+        kb_buttons = []
+        for app in apps:
+            app_id, name, _, _, _ = app
+            short_name = name if len(name) <= 30 else name[:27] + "..."
+            kb_buttons.append([InlineKeyboardButton(
+                text=f"ID {app_id}: {short_name}",
+                callback_data=f"del:{app_id}"
+            )])
+        kb_buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="admin:back")])
+        keyboard = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+        await callback.message.edit_text("Выберите приложение для удаления:", reply_markup=keyboard)
+    else:
+        # Если приложений не осталось, возвращаемся в главное меню
+        await callback.message.edit_text("Список приложений пуст.", reply_markup=get_admin_keyboard())
+
+# ---------- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ (команды и пользовательская часть) ----------
 # Команда /add_app (только админ)
 @dp.message(Command("add_app"), StateFilter(None))
 async def cmd_add_app(message: Message, state: FSMContext):
@@ -204,6 +323,15 @@ async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено.", reply_markup=reply_keyboard)
 
+# Команда /start
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! Я бот, который поможет тебе узнать о заработке без вложений.\n"
+        "Нажми кнопку ниже, чтобы получить информацию.",
+        reply_markup=reply_keyboard
+    )
+
 # Обработчик reply-кнопки "Заработок без вложений"
 @dp.message(lambda message: message.text == "Заработок без вложений")
 async def show_apps(message: Message):
@@ -212,7 +340,7 @@ async def show_apps(message: Message):
         await message.answer("Пока нет добавленных приложений.", reply_markup=reply_keyboard)
         return
     user_id = message.from_user.id
-    user_app_index[user_id] = 0  # всегда начинаем с первого
+    user_app_index[user_id] = 0
     await send_app_message(message.chat.id, user_id, 0)
 
 # Функция отправки карточки приложения с навигацией
@@ -224,14 +352,12 @@ async def send_app_message(chat_id, user_id, index):
     app_id, name, description, link, photo_file_id = app
     text = f"<b>{name}</b>\n\n{description}\n\n<a href='{link}'>🔗 Ссылка на приложение</a>"
 
-    # Построение инлайн-клавиатуры
     buttons = []
     if index > 0:
         buttons.append(InlineKeyboardButton(text="◀️", callback_data=f"nav:prev:{index}"))
     if index < len(apps) - 1:
         buttons.append(InlineKeyboardButton(text="▶️", callback_data=f"nav:next:{index}"))
     counter = InlineKeyboardButton(text=f"{index+1}/{len(apps)}", callback_data="ignore")
-    # Если есть обе кнопки — ряд из двух, затем счётчик отдельно
     if buttons:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[buttons, [counter]])
     else:
@@ -262,7 +388,6 @@ async def process_navigation(callback: CallbackQuery):
         await callback.answer("Невозможно перейти")
         return
     user_app_index[user_id] = new_index
-    # Удаляем старое сообщение и отправляем новое (для смены фото)
     await callback.message.delete()
     await send_app_message(callback.message.chat.id, user_id, new_index)
     await callback.answer()
