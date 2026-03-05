@@ -113,6 +113,7 @@ def set_setting(key: str, value: str):
         conn.close()
 
 async def is_subscribed(user_id: int) -> bool:
+    """Проверяет подписку на канал и группу (если они настроены)"""
     channel_id = get_setting('channel_id')
     group_id = get_setting('group_id')
     try:
@@ -127,8 +128,9 @@ async def is_subscribed(user_id: int) -> bool:
         return True
     except Exception as e:
         logging.error(f"Subscription check error: {e}")
-        return True
+        return True  # При ошибке (бот не админ и т.п.) пропускаем
 
+# Middleware для проверки подписки перед каждым действием (кроме /start)
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -137,13 +139,16 @@ class SubscriptionMiddleware(BaseMiddleware):
         data: Dict[str, Any]
     ) -> Any:
         try:
+            # Команда /start обрабатывается отдельно, middleware её пропускает
             if isinstance(event, Message) and event.text and event.text.startswith('/start'):
                 return await handler(event, data)
 
             user = event.from_user
+            # Администраторы освобождены от проверки
             if is_admin(user):
                 return await handler(event, data)
 
+            # Если пользователь не подписан – показываем сообщение с требованием подписки
             if not await is_subscribed(user.id):
                 channel_link = get_setting('channel_link')
                 group_link = get_setting('group_link')
@@ -166,11 +171,11 @@ class SubscriptionMiddleware(BaseMiddleware):
                 else:
                     await event.message.answer(text, reply_markup=keyboard)
                     await event.answer()
-                return
+                return  # Не передаём дальше
             return await handler(event, data)
         except Exception as e:
             logging.error(f"Middleware error: {e}")
-            return await handler(event, data)
+            return await handler(event, data)  # Пропускаем при ошибке
 
 # ==================== РАБОТА С ПРИЛОЖЕНИЯМИ/САЙТАМИ ====================
 def get_all_apps():
@@ -243,16 +248,17 @@ def add_user(user_id, username, first_name, referred_by=None):
     try:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
         if cur.fetchone():
             cur.execute(
                 "UPDATE users SET username=?, first_name=?, last_active=? WHERE user_id=?",
-                (username, first_name, datetime.now(), user_id)
+                (username, first_name, now_str, user_id)
             )
         else:
             cur.execute(
                 "INSERT INTO users (user_id, username, first_name, referred_by, last_active) VALUES (?, ?, ?, ?, ?)",
-                (user_id, username, first_name, referred_by, datetime.now())
+                (user_id, username, first_name, referred_by, now_str)
             )
         conn.commit()
     except Exception as e:
@@ -264,7 +270,8 @@ def update_last_active(user_id):
     try:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
-        cur.execute("UPDATE users SET last_active=? WHERE user_id=?", (datetime.now(), user_id))
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        cur.execute("UPDATE users SET last_active=? WHERE user_id=?", (now_str, user_id))
         conn.commit()
     except Exception as e:
         logging.error(f"Error update_last_active: {e}")
@@ -393,9 +400,10 @@ def get_total_users():
 def get_active_users(days=7):
     try:
         since = datetime.now() - timedelta(days=days)
+        since_str = since.strftime('%Y-%m-%d %H:%M:%S')
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (since,))
+        cur.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?", (since_str,))
         return cur.fetchone()[0]
     except Exception as e:
         logging.error(f"Error get_active_users: {e}")
@@ -468,9 +476,10 @@ def add_support_ticket(user_id, username, first_name, message_text):
     try:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         cur.execute(
-            "INSERT INTO support_tickets (user_id, username, first_name, message) VALUES (?, ?, ?, ?)",
-            (user_id, username, first_name, message_text)
+            "INSERT INTO support_tickets (user_id, username, first_name, message, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, first_name, message_text, now_str)
         )
         conn.commit()
         return cur.lastrowid
@@ -508,9 +517,10 @@ def update_ticket_reply(ticket_id, admin_reply):
     try:
         conn = sqlite3.connect(DB_NAME)
         cur = conn.cursor()
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         cur.execute(
             "UPDATE support_tickets SET admin_reply=?, status='answered', replied_at=? WHERE id=?",
-            (admin_reply, datetime.now(), ticket_id)
+            (admin_reply, now_str, ticket_id)
         )
         conn.commit()
     except Exception as e:
@@ -637,6 +647,7 @@ async def cmd_start(message: Message, command: CommandObject):
         username = message.from_user.username
         first_name = message.from_user.first_name
 
+        # Проверяем подписку (если настроено)
         if not is_admin(message.from_user) and not await is_subscribed(user_id):
             channel_link = get_setting('channel_link')
             group_link = get_setting('group_link')
@@ -657,6 +668,7 @@ async def cmd_start(message: Message, command: CommandObject):
             await message.answer(text, reply_markup=keyboard)
             return
 
+        # Если подписка есть или не настроена – продолжаем
         existing = get_user(user_id)
         if not existing:
             referred_by = None
@@ -1346,12 +1358,7 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
 async def add_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await message.answer("Введите описание:")
-    await state.set_state(AddApp)
-    await message.answer("Введите описание:")
     await state.set_state(AddApp.description)
-
-@dp.message(AddApp.description)
-async def add_description(message:.description)
 
 @dp.message(AddApp.description)
 async def add_description(message: Message, state: FSMContext):
@@ -1360,87 +1367,41 @@ async def add_description(message: Message, state: FSMContext):
     await state.set_state(AddApp.link)
 
 @dp.message(AddApp.link)
-async def add Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("Введите ссылку:")
-    await state.set_state(AddApp.link)
-
-@dp.message(AddApp.link)
-async def add_link(message_link(message: Message, state: FSMContext):
+async def add_link(message: Message, state: FSMContext):
     await state.update_data(link=message.text)
-: Message, state: FSMContext):
-    await state.update_data(link=message.text)
-    await message.answer("Отправьте фото (или напишите 'пропу    await message.answer("Отправьте фото (или напишите 'пстить'):")
+    await message.answer("Отправьте фото (или напишите 'пропустить'):")
     await state.set_state(AddApp.photo)
 
-@dp.messageропустить'):")
-    await state.set_state(AddApp.photo)
-
-@dp.message(AddApp.photo, F.(AddApp.photo, F.photo)
+@dp.message(AddApp.photo, F.photo)
 async def add_photo(message: Message, state: FSMContext):
-   photo)
-async def add_photo(message: Message, state: FSMContext photo_file_id = message.photo[-1].file_id
-    data = await state.get_data()
-    content_type = data['content_type']
-):
     photo_file_id = message.photo[-1].file_id
     data = await state.get_data()
-    content_type = data['content    count_before = get_count_by_type(content_type)
-    app_id = add_app(
-       _type']
+    content_type = data['content_type']
     count_before = get_count_by_type(content_type)
-    app_id = name=data['name'],
-        description=data['description'],
-        link=data['link'],
-        photo_file_id=photo_file_id,
-        platform=data[' add_app(
+    app_id = add_app(
         name=data['name'],
         description=data['description'],
         link=data['link'],
         photo_file_id=photo_file_id,
-        platformplatform'],
-        type=content_type
-    )
-    if app_id:
-        number = count_before + 1
-        type_text = "приложение" if content_type == "app" else "сайт"
-        await message.answer(f"✅ {type_text.capitalize()} добав=data['platform'],
+        platform=data['platform'],
         type=content_type
     )
     if app_id:
         number = count_before + 1
         type_text = "приложение" if content_type == "app" else "сайт"
         await message.answer(f"✅ {type_text.capitalize()} добавлено с ID {app_id}. Это {type_text} №{number}.", reply_markup=reply_keyboard)
-лено с ID {app_id}. Это {type_text} №{number}.", reply_markup=reply_keyboard)
     else:
-        await message.answer("❌ Ошибка при добав    else:
-        await message.answer("❌ Ошибкалении.")
-    await state.clear()
-
-@dp.message(AddApp.photo, F.text.lower() при добавлении.")
+        await message.answer("❌ Ошибка при добавлении.")
     await state.clear()
 
 @dp.message(AddApp.photo, F.text.lower() == "пропустить")
-async == "пропустить")
 async def skip_photo(message: Message, state: FSMContext):
     data = await state.get_data()
     content_type = data['content_type']
-    count_before = get_count_by_type def skip_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
-    content_type = data['content_type']
-    count_b(content_type)
+    count_before = get_count_by_type(content_type)
     app_id = add_app(
         name=data['name'],
         description=data['description'],
-        link=data['efore = get_count_by_type(content_type)
-    app_id = add_app(
-        name=data['name'],
-        descriptionlink'],
-        photo_file_id=None,
-        platform=data['platform'],
-        type=content_type
-    )
-    if=data['description'],
         link=data['link'],
         photo_file_id=None,
         platform=data['platform'],
@@ -1448,57 +1409,29 @@ async def skip_photo(message: Message, state: FSMContext):
     )
     if app_id:
         number = count_before + 1
-        app_id:
-        number = count_before + 1
-        type_text = "приложение type_text = "приложение" if content_type == "app" else "сайт"
-        await message." if content_type == "app" else "сайт"
+        type_text = "приложение" if content_type == "app" else "сайт"
         await message.answer(f"✅ {type_text.capitalize()} добавлено с ID {app_id} (без фото). Это {type_text} №{number}.", reply_markup=reply_keyboard)
-    else:
-        await message.answer("❌ Ошибка при добавanswer(f"✅ {type_text.capitalize()} добавлено с ID {app_id} (без фото). Это {type_text} №{number}.", reply_markup=reply_keyboard)
     else:
         await message.answer("❌ Ошибка при добавлении.")
     await state.clear()
 
-@dp.message(AddApp.лении.")
-    await state.clear()
-
 @dp.message(AddApp.photo)
 async def incorrect_photo(message: Message):
-    await message.answer("Пожалуйста, отправьте фото или напишите 'пphoto)
-async def incorrect_photo(message: Message):
     await message.answer("Пожалуйста, отправьте фото или напишите 'пропустить'.")
-
-@dp.message(Command("cancel"))
-async def cmd_cancel(message: Message,ропустить'.")
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
         await message.answer("Нет активного действия.")
-        return state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Нет активного действия.")
         return
-   
     await state.clear()
-    await message.answer("Действие отменено await state.clear()
     await message.answer("Действие отменено.", reply_markup=reply_keyboard)
 
 @dp.message()
 async def other_messages(message: Message):
     await message.answer(
-        "Я понимаю только команды /start, /stats.", reply_markup=reply_keyboard)
-
-@dp.message()
-async def other_messages(message: Message):
-    await message.answer(
-        "Я понимаю только команды /start, /stats, /history, /support и кнопки, /history, /support и кнопки меню.",
-        reply_markup=reply_keyboard
-    )
-
-# ==================== З меню.",
+        "Я понимаю только команды /start, /stats, /history, /support и кнопки меню.",
         reply_markup=reply_keyboard
     )
 
@@ -1507,12 +1440,5 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)
 
-if __АПУСК ====================
-async def main():
-    logging.basicConfig(level=logging.INFO)
-    await dp.start_polling(bot)
-
 if __name__ == "__main__":
-    asyncio.run(main())
-```name__ == "__main__":
     asyncio.run(main())
