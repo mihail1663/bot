@@ -1,0 +1,49 @@
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, Message
+
+logging.basicConfig(level=logging.INFO)
+
+API_TOKEN = "8461817952:AAG6rIP32PGJy8VJXATI7FXUH9Ed-lXwO2E"
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher()
+
+# Создаём клавиатуру
+reply_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Заработок без вложений")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+    input_field_placeholder="Нажмите кнопку для получения информации"
+)
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        "Привет! Я бот, который поможет тебе узнать о заработке без вложений.\n"
+        "Нажми кнопку ниже, чтобы получить информацию.",
+        reply_markup=reply_keyboard
+    )
+
+@dp.message(lambda message: message.text == "Заработок без вложений")
+async def earn_without_invest(message: Message):
+    # Здесь можно разместить любой текст, ссылки, инструкции и т.д.
+    text = "Заработок без вложений: информация будет добавлена позже."
+    await message.answer(text, parse_mode="Markdown")
+
+@dp.message()
+async def other_messages(message: Message):
+    await message.answer(
+        "Я понимаю только команду /start и кнопку «Заработок без вложений».",
+        reply_markup=reply_keyboard   # исправлено: было "board", стало "reply_keyboard"
+    )
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())   # исправлено: было "async.run", стало "asyncio.run"
